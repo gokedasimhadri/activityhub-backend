@@ -3,6 +3,8 @@ const Activity = require('../models/Activity');
 const StudentRegistration = require('../models/StudentRegistration');
 const { auth } = require('../middleware/auth');
 const { TYPES } = require('../config/types');
+const unifiedIntegration = require('../services/unifiedIntegration');
+const { fetchStudentByRollNumber } = require('../services/studentApiService');
 
 // Middleware: student-only authorization
 const studentAuth = (req, res, next) => {
@@ -28,86 +30,70 @@ const optionalAuth = async (req, res, next) => {
   next();
 };
 
+
+/**
+ * GET /api/student/lookup/:rollNumber
+ * Secure server-side lookup using the confidential Student API
+ */
+router.get('/lookup/:rollNumber', async (req, res) => {
+  try {
+    const student = await fetchStudentByRollNumber(req.params.rollNumber);
+    if (!student) {
+      return res.status(404).json({ success: false, message: 'Student not found in official registry' });
+    }
+    return res.json({ success: true, student });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 /**
  * GET /api/student/activities
  * Public or authenticated list of activities available to students
- * Returns activities that are enabled OR approved, and target audience is Students or Both
+ * Merges released activities from Unified Portal and local activities
  */
 router.get('/activities', optionalAuth, async (req, res) => {
   try {
     const studentRoll = req.user?.rollNumber || '';
 
-    const query = {
-      $and: [
-        {
-          $or: [
-            { isEnabled: true },
-            { status: 'approved', isEnabled: { $ne: false } }
-          ]
-        },
-        {
-          targetAudience: { $in: ['Students', 'Both', undefined, null] }
-        }
-      ]
-    };
-
-    const activities = await Activity.find(query)
-      .sort({ startDate: -1 })
-      .limit(200)
-      .lean();
-
-    // Fetch registration counts
-    const actIds = activities.map((a) => a._id);
-    const regCounts = await StudentRegistration.aggregate([
-      { $match: { activity: { $in: actIds } } },
-      { $group: { _id: '$activity', count: { $sum: 1 } } }
-    ]);
-    const countMap = Object.fromEntries(regCounts.map((r) => [String(r._id), r.count]));
-
-    // Check which ones the student is registered for
-    let myRegisteredSet = new Set();
-    if (studentRoll) {
-      const myRegs = await StudentRegistration.find({
-        activity: { $in: actIds },
-        rollNumber: studentRoll.toUpperCase()
-      }).select('activity').lean();
-      myRegisteredSet = new Set(myRegs.map((r) => String(r.activity)));
+    // 1. Fetch published activities released from Unified Portal (Faculty Coordinator)
+    let unifiedActivities = [];
+    try {
+      unifiedActivities = await unifiedIntegration.getPublishedUnifiedActivities({ rollNumber: studentRoll });
+    } catch (uErr) {
+      console.warn('Could not fetch Unified Portal activities:', uErr.message);
     }
 
-    const result = activities.map((a) => {
-      const typeInfo = TYPES[a.type] || { label: a.type, color: '#2b4fd8' };
-      return {
-        _id: a._id,
-        title: a.title,
-        type: a.type,
-        activityType: typeInfo.label,
-        typeInfo,
-        department: a.department,
-        academicYear: a.academicYear,
-        startDate: a.startDate,
-        endDate: a.endDate,
-        description: a.description,
-        targetAudience: a.targetAudience || 'Both',
-        registrationCount: countMap[String(a._id)] || 0,
-        isRegistered: myRegisteredSet.has(String(a._id)),
-        isEnabled: a.isEnabled !== false
-      };
-    });
-
-    res.json(result);
+    // Only activities where cards have been added and released by the Faculty Coordinator are visible to students
+    res.json(unifiedActivities);
   } catch (err) {
     console.error('Error fetching student activities:', err);
     res.status(500).json({ message: 'Failed to retrieve activities' });
   }
 });
 
+
 /**
  * GET /api/student/activities/:id
- * Single activity details with dynamic form fields based on TYPES
+ * Activity details & registration form configuration
  */
 router.get('/activities/:id', optionalAuth, async (req, res) => {
   try {
-    const a = await Activity.findById(req.params.id).lean();
+    const actId = req.params.id;
+    const studentRoll = req.user?.rollNumber || '';
+
+    // 1. Check if this is a Unified activity
+    try {
+      const unifiedAct = await unifiedIntegration.getUnifiedActivityById(actId, { rollNumber: studentRoll });
+      if (unifiedAct) {
+        return res.json(unifiedAct);
+      }
+    } catch (uErr) {
+      console.warn('Unified activity lookup warning:', uErr.message);
+    }
+
+    // 2. Fall back to local Activity
+    const a = await Activity.findById(actId).lean();
     if (!a) {
       return res.status(404).json({ message: 'Activity not found' });
     }
@@ -124,10 +110,10 @@ router.get('/activities/:id', optionalAuth, async (req, res) => {
     ];
 
     let isRegistered = false;
-    if (req.user?.rollNumber) {
+    if (studentRoll) {
       const existing = await StudentRegistration.findOne({
         activity: a._id,
-        rollNumber: req.user.rollNumber.toUpperCase()
+        rollNumber: studentRoll.toUpperCase()
       });
       isRegistered = !!existing;
     }
@@ -147,7 +133,8 @@ router.get('/activities/:id', optionalAuth, async (req, res) => {
       details: a.details || {},
       targetAudience: a.targetAudience || 'Both',
       isEnabled: a.isEnabled !== false,
-      isRegistered
+      isRegistered,
+      isUnified: false
     });
   } catch (err) {
     console.error('Error fetching activity details:', err);
@@ -157,7 +144,7 @@ router.get('/activities/:id', optionalAuth, async (req, res) => {
 
 /**
  * POST /api/student/register/:id
- * Student registers for an activity
+ * Student registers for an activity (Unified Portal or Local)
  */
 router.post('/register/:id', auth, studentAuth, async (req, res) => {
   try {
@@ -168,6 +155,67 @@ router.post('/register/:id', auth, studentAuth, async (req, res) => {
       return res.status(400).json({ message: 'Roll number is required for registration' });
     }
 
+    // 1. Check if this is a Unified Portal activity
+    const unifiedAct = await unifiedIntegration.getUnifiedActivityById(actId, { rollNumber: cleanRoll });
+    if (unifiedAct) {
+      try {
+        const regResult = await unifiedIntegration.registerStudentForUnifiedActivity(actId, {
+          rollNumber: cleanRoll,
+          studentName: req.body.studentName || req.body.participantName || req.user.name,
+          email: req.body.email || req.user.email,
+          phone: req.body.phone || '',
+          branch: req.body.branch || req.body.department || req.user.department || 'CSE',
+          gender: req.body.gender || 'Male',
+          academicYear: req.body.academicYear || unifiedAct.academicYear || '2026-27'
+        });
+
+        if (regResult.alreadyRegistered) {
+          try {
+            await StudentRegistration.create({
+              activity: unifiedAct._id,
+              activityTitle: unifiedAct.title,
+              activityType: unifiedAct.activityType || 'University Activity',
+              rollNumber: cleanRoll,
+              studentName: req.body.studentName || req.user.name || '',
+              formData: {
+                ...req.body,
+                registrationId: regResult.registrationId,
+                source: 'UNIFIED_PORTAL'
+              }
+            });
+          } catch {}
+          return res.status(409).json({ message: regResult.message });
+        }
+
+        // Also cache locally in StudentRegistration for student's /my-registrations
+        try {
+          await StudentRegistration.create({
+            activity: unifiedAct._id,
+            activityTitle: unifiedAct.title,
+            activityType: unifiedAct.activityType || 'University Activity',
+            rollNumber: cleanRoll,
+            studentName: req.body.studentName || req.user.name || '',
+            formData: {
+              ...req.body,
+              registrationId: regResult.registrationId,
+              source: 'UNIFIED_PORTAL'
+            }
+          });
+        } catch (cacheErr) {
+          // ignore duplicate in local cache
+        }
+
+        return res.status(201).json({
+          success: true,
+          message: 'Successfully registered for activity!',
+          ...regResult
+        });
+      } catch (uRegErr) {
+        return res.status(400).json({ message: uRegErr.message || 'Unified registration error' });
+      }
+    }
+
+    // 2. Handle Local Activity registration
     const activity = await Activity.findById(actId);
     if (!activity) {
       return res.status(404).json({ message: 'Activity not found' });
@@ -194,7 +242,7 @@ router.post('/register/:id', auth, studentAuth, async (req, res) => {
       activityType: typeInfo?.label || activity.type,
       rollNumber: cleanRoll,
       studentName: req.user.name || '',
-      formData: req.body.formData || {}
+      formData: req.body.formData || req.body
     });
 
     res.status(201).json(reg);
@@ -209,7 +257,7 @@ router.post('/register/:id', auth, studentAuth, async (req, res) => {
 
 /**
  * GET /api/student/my-registrations
- * List current student's registered activities
+ * List current student's registered activities (Local & Unified)
  */
 router.get('/my-registrations', auth, studentAuth, async (req, res) => {
   try {
@@ -218,22 +266,40 @@ router.get('/my-registrations', auth, studentAuth, async (req, res) => {
       return res.json([]);
     }
 
-    const regs = await StudentRegistration.find({ rollNumber })
-      .populate('activity')
-      .sort({ registeredAt: -1 })
-      .lean();
+    const [unifiedRegs, regs] = await Promise.all([
+      unifiedIntegration.getStudentUnifiedRegistrations(rollNumber).catch(() => []),
+      StudentRegistration.find({ rollNumber })
+        .populate('activity')
+        .sort({ registeredAt: -1 })
+        .lean()
+    ]);
 
-    const formatted = regs.map((r) => {
+    const seenRegIds = new Set();
+    const seenTitles = new Set();
+
+    const unifiedFormatted = (unifiedRegs || []).map((u) => {
+      if (u.formData?.registrationId) seenRegIds.add(u.formData.registrationId);
+      if (u.activity?.title) seenTitles.add(u.activity.title);
+      return u;
+    });
+
+    const localFormatted = [];
+    for (const r of regs) {
+      const regId = r.formData?.registrationId;
       const act = r.activity || {};
+      const title = act.title || r.activityTitle || 'Registered Activity';
+      if ((regId && seenRegIds.has(regId)) || (r.formData?.source === 'UNIFIED_PORTAL' && seenTitles.has(title))) {
+        continue;
+      }
       const typeKey = act.type || (r.activityType || '').toLowerCase().replace(/[^a-z]/g, '_');
       const typeInfo = TYPES[typeKey] || { label: r.activityType || act.type || 'Activity', color: '#2b4fd8' };
-      return {
+      localFormatted.push({
         _id: r._id,
         registeredAt: r.registeredAt,
         formData: r.formData || {},
         activity: {
           _id: act._id || r.activity,
-          title: act.title || r.activityTitle || 'Registered Activity',
+          title,
           type: typeKey,
           activityType: typeInfo.label,
           department: act.department || '—',
@@ -241,10 +307,14 @@ router.get('/my-registrations', auth, studentAuth, async (req, res) => {
           endDate: act.endDate
         },
         typeInfo
-      };
-    });
+      });
+    }
 
-    res.json(formatted);
+    const combined = [...unifiedFormatted, ...localFormatted].sort(
+      (a, b) => new Date(b.registeredAt || 0) - new Date(a.registeredAt || 0)
+    );
+
+    res.json(combined);
   } catch (err) {
     console.error('Error fetching student registrations:', err);
     res.status(500).json({ message: 'Failed to retrieve your registrations' });

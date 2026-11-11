@@ -27,7 +27,12 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/activity_hub';
+const MONGO_URI = process.env.MONGO_URI;
+
+if (!MONGO_URI) {
+  console.error('MONGO_URI is missing in .env file');
+  process.exit(1);
+}
 
 mongoose.connect(MONGO_URI)
   .then(() => {

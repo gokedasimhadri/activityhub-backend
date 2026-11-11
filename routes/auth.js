@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
+const { fetchStudentByRollNumber } = require('../services/studentApiService');
 
 const sign = (u) => jwt.sign({ id: u._id }, process.env.JWT_SECRET || 'activityhub_jwt_secret_aditya_univ', { expiresIn: '7d' });
 const pub = (u) => ({
@@ -81,18 +82,28 @@ router.post('/login', async (req, res) => {
     ]
   });
 
-  // If user does not exist yet but is a student roll number, create it on the fly
+  // If user does not exist yet but is a student roll number, verify with Student API and create on the fly
   const isRollPattern = /^[0-9]{2}[A-Z0-9]{8}$/i.test(rawInput);
   if (!user && isRollPattern) {
+    const studentInfo = await fetchStudentByRollNumber(upperInput);
     const defaultHash = await bcrypt.hash('password123', 10);
     user = await User.create({
-      name: `Student (${upperInput})`,
-      email: `${lowerInput}@adityauniversity.in`,
+      name: studentInfo?.name || `Student (${upperInput})`,
+      email: (studentInfo?.email || `${lowerInput}@adityauniversity.in`).toLowerCase(),
       rollNumber: upperInput,
-      department: 'CSE',
+      department: studentInfo?.department || studentInfo?.branch || 'CSE',
       password: defaultHash,
       role: 'student'
     });
+  } else if (user && user.role === 'student' && user.name.startsWith('Student (')) {
+    // If student was previously created with placeholder name, enrich from official Student API
+    const studentInfo = await fetchStudentByRollNumber(user.rollNumber || upperInput);
+    if (studentInfo?.name) {
+      user.name = studentInfo.name;
+      if (studentInfo.email) user.email = studentInfo.email.toLowerCase();
+      if (studentInfo.department) user.department = studentInfo.department;
+      await user.save();
+    }
   }
 
   if (!user) {
